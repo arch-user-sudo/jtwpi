@@ -1,7 +1,7 @@
 CC      ?= cc
 PKGS    := gtk+-3.0 gtk-layer-shell-0 gio-2.0 gdk-pixbuf-2.0
 
-CFLAGS  ?= -march=native -O2 -g
+CFLAGS  ?= -march=native -O2 -g -flto -s
 CFLAGS  += -Wall -Wextra -Wno-unused-parameter -std=gnu11
 CFLAGS  += $(shell pkg-config --cflags $(PKGS))
 LDLIBS  += $(shell pkg-config --libs $(PKGS)) -lm

@@ -9,21 +9,25 @@ LDLIBS  += $(shell pkg-config --libs $(PKGS)) -lm
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 
-TARGET  := jtwpi
-SRC     := jtwpi.c
+TARGETS := jtwpi jtwpictl
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(LDLIBS)
+jtwpi: jtwpi.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
-install: $(TARGET)
-	install -Dm755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+jtwpictl: jtwpictl.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+install: $(TARGETS)
+	install -Dm755 jtwpi $(DESTDIR)$(BINDIR)/jtwpi
+	install -Dm755 jtwpictl $(DESTDIR)$(BINDIR)/jtwpictl
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
+	rm -f $(DESTDIR)$(BINDIR)/jtwpi
+	rm -f $(DESTDIR)$(BINDIR)/jtwpictl
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
 
 .PHONY: all install uninstall clean

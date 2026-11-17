@@ -8,6 +8,11 @@
  * Build: make
  * Run:   ./jtwpi          (layer-shell desktop layer)
  *        ./jtwpi --windowed
+ *        ./jtwpi '#RRGGBB'   (initial accent override)
+ *
+ * A control socket at $XDG_RUNTIME_DIR/jtwpi-ctl.sock accepts
+ * "accent #RRGGBB\n" and "quit". JTLab uses it to follow the wallpaper accent
+ * live; jtwpictl provides the same commands from the shell.
  */
 
 #include <gdk-pixbuf/gdk-pixbuf.h>
@@ -21,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define APP_ID            "org.jtl.jtwpi"
 #define APP_NAME          "jtwpi"
@@ -34,10 +40,11 @@
 #define CELL_LABEL_GAP    3
 #define LABEL_HEIGHT      34
 #define CELL_PAD_BOTTOM   8
-#define GRID_MARGIN       24
-#define BOTTOM_MARGIN     56
+#define GRID_MARGIN       12
+#define BOTTOM_MARGIN     12
 #define DRAG_THRESHOLD    4
 #define MAX_THUMB_BYTES   (64LL * 1024 * 1024)
+#define DEFAULT_ACCENT_RGB 0xE8A03C  /* JTLab's fallback accent */
 
 /* Startup waits.  Polling sleeps between checks, so a compositor that is
  * still coming up does not cost any CPU while we wait. */
@@ -126,6 +133,11 @@ struct App {
     PangoFontDescription *label_font;
     GList *clip_files;
     gboolean clip_cut;
+    unsigned accent_rgb;
+    double accent_f[3];
+    double accent_hi_f[3];
+    GSocketService *ctl_service;
+    gboolean ctl_created;
 };
 
 static App *g_app = NULL;
@@ -181,6 +193,10 @@ static gboolean canvas_begin_dnd(Canvas *c, GdkEvent *event, double x, double y)
 static void app_create_windows(void);
 static void app_destroy_windows(void);
 static void app_schedule_rebuild_windows(void);
+static void app_set_accent(App *a, unsigned rgb);
+static int accent_parse(const char *s, unsigned *out);
+static void ctl_init(App *a);
+static void ctl_shutdown(App *a);
 
 /* ---- small helpers -------------------------------------------------------- */
 
@@ -764,6 +780,23 @@ canvas_cell_h(void)
            LABEL_HEIGHT + CELL_PAD_BOTTOM;
 }
 
+/* Single source of truth for the usable grid area. Auto-placement, clamping
+ * and overlap resolution must all agree here, or icons end up in the padding
+ * near the screen edge. */
+static void
+canvas_grid_bounds(Canvas *c, int *min_x, int *min_y, int *max_x, int *max_y)
+{
+    int cw = canvas_cell_w();
+    int ch = canvas_cell_h();
+
+    *min_x = GRID_MARGIN;
+    *min_y = GRID_MARGIN;
+    *max_x = c->width - cw - GRID_MARGIN;
+    *max_y = c->height - ch - BOTTOM_MARGIN;
+    if (*max_x < *min_x) *max_x = *min_x;
+    if (*max_y < *min_y) *max_y = *min_y;
+}
+
 static void
 canvas_snap_xy(int *x, int *y)
 {
@@ -780,26 +813,18 @@ canvas_clamp_icon(Canvas *c, Icon *ic)
 {
     int cw = canvas_cell_w();
     int ch = canvas_cell_h();
-    int max_x = c->width - cw;
-    int max_y = c->height - ch;
-    if (max_x < 0) max_x = 0;
-    if (max_y < 0) max_y = 0;
+    int min_x, min_y, max_x, max_y;
+    canvas_grid_bounds(c, &min_x, &min_y, &max_x, &max_y);
 
     /* Keep edge-clamped icons on the grid too, instead of letting them sit at
      * a non-grid position just because the surface is a little too small. */
     if (g_app->snap) {
-        if (max_x >= GRID_MARGIN)
-            max_x = GRID_MARGIN + (((max_x - GRID_MARGIN) / cw) * cw);
-        else
-            max_x = 0;
-        if (max_y >= GRID_MARGIN)
-            max_y = GRID_MARGIN + (((max_y - GRID_MARGIN) / ch) * ch);
-        else
-            max_y = 0;
+        max_x = min_x + (((max_x - min_x) / cw) * cw);
+        max_y = min_y + (((max_y - min_y) / ch) * ch);
     }
 
-    if (ic->x < 0) ic->x = 0;
-    if (ic->y < 0) ic->y = 0;
+    if (ic->x < min_x) ic->x = min_x;
+    if (ic->y < min_y) ic->y = min_y;
     if (ic->x > max_x) ic->x = max_x;
     if (ic->y > max_y) ic->y = max_y;
 }
@@ -843,12 +868,8 @@ canvas_auto_place(Canvas *c, Icon *ic)
     ic->want_x = ic->want_y = -1;
     int cw = canvas_cell_w();
     int ch = canvas_cell_h();
-    int left = GRID_MARGIN;
-    int top = GRID_MARGIN;
-    int max_x = c->width - cw - GRID_MARGIN;
-    int max_y = c->height - ch - BOTTOM_MARGIN;
-    if (max_x < left) max_x = left;
-    if (max_y < top) max_y = top;
+    int left, top, max_x, max_y;
+    canvas_grid_bounds(c, &left, &top, &max_x, &max_y);
     int cols = ((max_x - left) / cw) + 1;
     int rows = ((max_y - top) / ch) + 1;
     if (cols < 1) cols = 1;
@@ -1057,10 +1078,13 @@ draw_icon(cairo_t *cr, Canvas *c, Icon *ic, double dx, double dy)
     int scale = c->scale > 0 ? c->scale : 1;
 
     if (ic->selected) {
-        cairo_set_source_rgba(cr, 0.20, 0.55, 1.0, 0.34);
+        cairo_set_source_rgba(cr, g_app->accent_f[0], g_app->accent_f[1],
+                              g_app->accent_f[2], 0.34);
         rounded_rect(cr, x + 2, y + 2, cw - 4, ch - 4, 7);
         cairo_fill(cr);
-        cairo_set_source_rgba(cr, 0.55, 0.78, 1.0, 0.95);
+        cairo_set_source_rgba(cr, g_app->accent_hi_f[0],
+                              g_app->accent_hi_f[1], g_app->accent_hi_f[2],
+                              0.95);
         cairo_set_line_width(cr, 1.2);
         rounded_rect(cr, x + 2, y + 2, cw - 4, ch - 4, 7);
         cairo_stroke(cr);
@@ -1142,10 +1166,13 @@ on_draw(GtkWidget *widget, cairo_t *cr, gpointer data)
         double y = MIN(c->sel_y0, c->sel_y1);
         double w = fabs(c->sel_x1 - c->sel_x0);
         double h = fabs(c->sel_y1 - c->sel_y0);
-        cairo_set_source_rgba(cr, 0.20, 0.55, 1.0, 0.16);
+        cairo_set_source_rgba(cr, g_app->accent_f[0], g_app->accent_f[1],
+                              g_app->accent_f[2], 0.16);
         cairo_rectangle(cr, x, y, w, h);
         cairo_fill(cr);
-        cairo_set_source_rgba(cr, 0.55, 0.78, 1.0, 0.95);
+        cairo_set_source_rgba(cr, g_app->accent_hi_f[0],
+                              g_app->accent_hi_f[1], g_app->accent_hi_f[2],
+                              0.95);
         cairo_set_line_width(cr, 1);
         cairo_rectangle(cr, x, y, w, h);
         cairo_stroke(cr);
@@ -2989,12 +3016,8 @@ canvas_find_free_cell(Canvas *c, int *x, int *y, Icon *except)
 {
     int cw = canvas_cell_w();
     int ch = canvas_cell_h();
-    int min_x = GRID_MARGIN;
-    int min_y = GRID_MARGIN;
-    int max_x = c->width - cw;
-    int max_y = c->height - ch;
-    if (max_x < min_x) max_x = min_x;
-    if (max_y < min_y) max_y = min_y;
+    int min_x, min_y, max_x, max_y;
+    canvas_grid_bounds(c, &min_x, &min_y, &max_x, &max_y);
 
     /* Clamp first: an off-screen drop must not fall through the bounds checks
      * below and then get clamped onto a neighbour later. */
@@ -3467,6 +3490,249 @@ on_icon_theme_changed(GObject *object, GParamSpec *pspec, gpointer data)
     app_reload_icons();
 }
 
+/* ---- accent + control socket ---------------------------------------------- */
+
+static int
+accent_hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int
+accent_parse(const char *s, unsigned *out)
+{
+    if (!s)
+        return 0;
+    if (*s == '#')
+        s++;
+    else if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        s += 2;
+    if (strlen(s) != 6)
+        return 0;
+
+    unsigned value = 0;
+    for (int i = 0; i < 6; i++) {
+        int nibble = accent_hex_nibble(s[i]);
+        if (nibble < 0)
+            return 0;
+        value = (value << 4) | (unsigned)nibble;
+    }
+    *out = value;
+    return 1;
+}
+
+static unsigned
+accent_mix(unsigned rgb, unsigned toward, double amount)
+{
+    int channels[3];
+    int target[3];
+    int mixed[3];
+    for (int i = 0; i < 3; i++) {
+        channels[i] = (int)((rgb >> (16 - (8 * i))) & 0xFF);
+        target[i] = (int)((toward >> (16 - (8 * i))) & 0xFF);
+        mixed[i] = (int)lround(channels[i] +
+                               (target[i] - channels[i]) * amount);
+        if (mixed[i] < 0) mixed[i] = 0;
+        if (mixed[i] > 255) mixed[i] = 255;
+    }
+    return ((unsigned)mixed[0] << 16) |
+           ((unsigned)mixed[1] << 8) |
+           (unsigned)mixed[2];
+}
+
+static void
+app_set_accent(App *a, unsigned rgb)
+{
+    if (!a)
+        return;
+    a->accent_rgb = rgb & 0xFFFFFF;
+    for (int i = 0; i < 3; i++) {
+        int shift = 16 - (8 * i);
+        a->accent_f[i] = (double)((a->accent_rgb >> shift) & 0xFF) / 255.0;
+    }
+    unsigned hi = accent_mix(a->accent_rgb, 0xFFFFFF, 0.35);
+    for (int i = 0; i < 3; i++) {
+        int shift = 16 - (8 * i);
+        a->accent_hi_f[i] = (double)((hi >> shift) & 0xFF) / 255.0;
+    }
+    if (a->canvases) {
+        for (guint i = 0; i < a->canvases->len; i++)
+            canvas_queue_draw(g_ptr_array_index(a->canvases, i));
+    }
+}
+
+/* Consume an optional leading '#RRGGBB' (or bare RRGGBB), and explicit
+ * --accent COLOR / --accent=COLOR forms, leaving other options for GTK. */
+static gboolean
+accent_cli(int *argc, char **argv, App *a)
+{
+    for (int i = 1; i < *argc; i++) {
+        const char *value = NULL;
+        int consumed = 0;
+
+        if (g_strcmp0(argv[i], "--accent") == 0) {
+            if (i + 1 >= *argc) {
+                g_printerr("%s: --accent requires a color\n", argv[0]);
+                return FALSE;
+            }
+            value = argv[i + 1];
+            consumed = 2;
+        } else if (g_str_has_prefix(argv[i], "--accent=")) {
+            value = argv[i] + strlen("--accent=");
+            consumed = 1;
+        } else if (argv[i][0] == '#') {
+            value = argv[i];
+            consumed = 1;
+        } else if (i == 1) {
+            unsigned candidate;
+            if (accent_parse(argv[i], &candidate)) {
+                value = argv[i];
+                consumed = 1;
+            }
+        }
+
+        if (!value)
+            continue;
+
+        unsigned rgb;
+        if (!accent_parse(value, &rgb)) {
+            g_printerr("%s: invalid accent color '%s' (expected #RRGGBB)\n",
+                       argv[0], value);
+            return FALSE;
+        }
+        app_set_accent(a, rgb);
+
+        for (int j = i; j + consumed < *argc; j++)
+            argv[j] = argv[j + consumed];
+        *argc -= consumed;
+        i--;
+    }
+    return TRUE;
+}
+
+static void
+ctl_path(char *buf, size_t n)
+{
+    const char *runtime = g_getenv("XDG_RUNTIME_DIR");
+    if (!runtime || !runtime[0])
+        runtime = "/tmp";
+    g_snprintf(buf, n, "%s/jtwpi-ctl.sock", runtime);
+}
+
+static gboolean
+quit_main(gpointer data)
+{
+    (void)data;
+    gtk_main_quit();
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean
+ctl_handle_line(App *a, const char *line)
+{
+    char *text = g_strdup(line);
+    g_strstrip(text);
+    gboolean handled = FALSE;
+
+    if (g_strcmp0(text, "quit") == 0) {
+        /* Let gtk_main() finish starting before asking it to unwind. */
+        g_timeout_add(250, quit_main, NULL);
+        handled = TRUE;
+    } else if (g_str_has_prefix(text, "accent")) {
+        const char *arg = text + strlen("accent");
+        while (g_ascii_isspace(*arg))
+            arg++;
+        unsigned rgb;
+        if (accent_parse(arg, &rgb)) {
+            app_set_accent(a, rgb);
+            handled = TRUE;
+        }
+    } else {
+        unsigned rgb;
+        if (accent_parse(text, &rgb)) {
+            app_set_accent(a, rgb);
+            handled = TRUE;
+        }
+    }
+    g_free(text);
+    return handled;
+}
+
+static gboolean
+ctl_incoming(GSocketService *service, GSocketConnection *conn,
+             GObject *source_object, gpointer data)
+{
+    (void)service;
+    (void)source_object;
+    App *a = data;
+    GSocket *socket = g_socket_connection_get_socket(conn);
+    if (socket) {
+        g_socket_set_blocking(socket, TRUE);
+        g_socket_set_timeout(socket, 2);
+    }
+
+    GInputStream *in = g_io_stream_get_input_stream(G_IO_STREAM(conn));
+    char buf[256];
+    gssize n = g_input_stream_read(in, buf, sizeof(buf) - 1, NULL, NULL);
+    if (n <= 0)
+        return TRUE;
+    buf[n] = '\0';
+
+    char **lines = g_strsplit(buf, "\n", -1);
+    for (int i = 0; lines[i]; i++)
+        ctl_handle_line(a, lines[i]);
+    g_strfreev(lines);
+    return TRUE;
+}
+
+static void
+ctl_init(App *a)
+{
+    char path[256];
+    ctl_path(path, sizeof(path));
+    unlink(path);
+
+    GError *err = NULL;
+    a->ctl_service = g_socket_service_new();
+    GSocketAddress *addr = g_unix_socket_address_new(path);
+    if (!g_socket_listener_add_address(G_SOCKET_LISTENER(a->ctl_service),
+                                       addr, G_SOCKET_TYPE_STREAM,
+                                       G_SOCKET_PROTOCOL_DEFAULT,
+                                       NULL, NULL, &err)) {
+        g_printerr("jtwpi: control socket %s: %s\n", path,
+                   err ? err->message : "unknown error");
+        if (err)
+            g_error_free(err);
+        g_object_unref(addr);
+        g_object_unref(a->ctl_service);
+        a->ctl_service = NULL;
+        return;
+    }
+    g_object_unref(addr);
+    a->ctl_created = TRUE;
+    g_signal_connect(a->ctl_service, "incoming",
+                     G_CALLBACK(ctl_incoming), a);
+}
+
+static void
+ctl_shutdown(App *a)
+{
+    if (a->ctl_service) {
+        g_socket_service_stop(a->ctl_service);
+        g_object_unref(a->ctl_service);
+        a->ctl_service = NULL;
+    }
+    if (a->ctl_created) {
+        char path[256];
+        ctl_path(path, sizeof(path));
+        unlink(path);
+        a->ctl_created = FALSE;
+    }
+}
+
 /* ---- lifecycle ------------------------------------------------------------ */
 
 static App *
@@ -3477,6 +3743,7 @@ app_new(void)
     a->icon_size = DEFAULT_ICON_SIZE;
     a->snap = TRUE;
     a->show_icons = TRUE;
+    app_set_accent(a, DEFAULT_ACCENT_RGB);
     a->state_path = g_build_filename(g_get_user_config_dir(), "jtwpi",
                                      "state.ini", NULL);
     return a;
@@ -3487,6 +3754,8 @@ app_free(App *a)
 {
     if (!a)
         return;
+    ctl_shutdown(a);
+    a->rebuilding = TRUE;  /* suppress on_window_destroy during teardown */
     app_destroy_windows();
     if (a->reload_timeout)
         g_source_remove(a->reload_timeout);
@@ -3514,17 +3783,21 @@ static void
 print_usage(const char *prog)
 {
     g_print(
-        "Usage: %s [OPTIONS]\n"
+        "Usage: %s [OPTIONS] [ACCENT]\n"
         "\n"
         "A desktop icon layer for wlroots Wayland compositors.\n"
         "\n"
         "Options:\n"
         "  --desktop PATH     Use PATH instead of the XDG desktop directory\n"
         "  --icon-size N      Icon size in pixels (24-128, default %d)\n"
+        "  --accent COLOR     Initial accent color, e.g. '#E8A03C'\n"
         "  --windowed         Run in a normal window instead of a layer surface\n"
         "  --hidden           Start with desktop icons hidden\n"
         "  --version          Print version and exit\n"
-        "  --help             Show this help\n",
+        "  --help             Show this help\n"
+        "\n"
+        "ACCENT may also be a leading '#RRGGBB' argument. Live accents are read\n"
+        "from $XDG_RUNTIME_DIR/jtwpi-ctl.sock.\n",
         prog, DEFAULT_ICON_SIZE);
 }
 
@@ -3590,6 +3863,12 @@ main(int argc, char **argv)
     App *a = app_new();
     g_app = a;
 
+    if (!accent_cli(&argc, argv, a)) {
+        app_free(a);
+        g_app = NULL;
+        return 1;
+    }
+
     for (int i = 1; i < argc; i++) {
         if (g_strcmp0(argv[i], "--windowed") == 0) {
             a->windowed = TRUE;
@@ -3653,6 +3932,7 @@ main(int argc, char **argv)
                          G_CALLBACK(on_icon_theme_changed), NULL);
 
     app_create_windows();
+    ctl_init(a);
 
     gtk_main();
 

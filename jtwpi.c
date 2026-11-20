@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 #define APP_ID            "org.jtl.jtwpi"
 #define APP_NAME          "jtwpi"
@@ -420,22 +421,30 @@ parse_position_value(const char *v, int *x, int *y, gboolean *auto_placed)
         return FALSE;
 
     char *end = NULL;
+    errno = 0;
     gint64 px = g_ascii_strtoll(v, &end, 10);
-    if (end == v || *end != ',')
+    if (errno == ERANGE || end == v || *end != ',')
         return FALSE;
 
     const char *p = end + 1;
+    errno = 0;
     gint64 py = g_ascii_strtoll(p, &end, 10);
-    if (end == p)
+    if (errno == ERANGE || end == p)
         return FALSE;
 
     gboolean pauto = FALSE;
     if (*end == ',') {
         const char *q = end + 1;
+        errno = 0;
         gint64 pv = g_ascii_strtoll(q, &end, 10);
-        if (end != q)
-            pauto = pv != 0;
+        if (errno == ERANGE || end == q)
+            return FALSE;
+        pauto = pv != 0;
     }
+    if (*end != '\0')
+        return FALSE;
+    if (px < G_MININT || px > G_MAXINT || py < G_MININT || py > G_MAXINT)
+        return FALSE;
 
     *x = (int)px;
     *y = (int)py;
@@ -594,8 +603,13 @@ icon_new(Canvas *c, const char *path)
         g_clear_object(&ic->icon);
         ic->icon = g_themed_icon_new("folder");
     }
-    if (!ic->icon)
-        ic->icon = g_content_type_get_icon(ic->content_type);
+    if (!ic->icon) {
+        /* content_type stays NULL if the file vanished before we could
+         * query it; g_content_type_get_icon(NULL) emits a GLib critical. */
+        ic->icon = ic->content_type
+            ? g_content_type_get_icon(ic->content_type)
+            : g_themed_icon_new("text-x-generic");
+    }
 
     ic->is_image = !ic->is_desktop && !ic->is_dir &&
                    ic->content_type && g_str_has_prefix(ic->content_type, "image/") &&
@@ -804,8 +818,12 @@ canvas_snap_xy(int *x, int *y)
         return;
     int cw = canvas_cell_w();
     int ch = canvas_cell_h();
-    *x = GRID_MARGIN + ((int)lround((*x - GRID_MARGIN) / (double)cw) * cw);
-    *y = GRID_MARGIN + ((int)lround((*y - GRID_MARGIN) / (double)ch) * ch);
+    /* Do the multiplication in double and clamp before narrowing: extreme
+     * (corrupt) state values could otherwise overflow a signed int. */
+    double sx = (double)lround((*x - GRID_MARGIN) / (double)cw) * (double)cw + GRID_MARGIN;
+    double sy = (double)lround((*y - GRID_MARGIN) / (double)ch) * (double)ch + GRID_MARGIN;
+    *x = (sx > G_MAXINT) ? G_MAXINT : (sx < G_MININT) ? G_MININT : (int)sx;
+    *y = (sy > G_MAXINT) ? G_MAXINT : (sy < G_MININT) ? G_MININT : (int)sy;
 }
 
 static void
@@ -889,8 +907,8 @@ canvas_auto_place(Canvas *c, Icon *ic)
     /* The grid is full.  Cascade by icon index instead of stacking every
      * overflow icon on the same cell. */
     int idx = icon_index(c, ic);
-    ic->x = left + ((idx % 5) * cw);
-    ic->y = top + ((idx % 7) * ch);
+    ic->x = left + ((idx % cols) * cw);
+    ic->y = top + ((idx % rows) * ch);
 }
 
 static void
@@ -1205,31 +1223,42 @@ unique_destination(const char *dir, const char *base)
         g_free(path);
         path = NULL;
     }
+    if (!path) {
+        /* Every numbered copy exists.  Falling back to the original path
+         * would make the copy/move fail with "file exists"; use a UUID so
+         * the operation still creates a distinct file. */
+        char *uuid = g_uuid_string_random();
+        char *cand = g_strdup_printf("%s-%s%s", stem, uuid, ext);
+        path = g_build_filename(dir, cand, NULL);
+        g_free(cand);
+        g_free(uuid);
+    }
     g_free(stem);
     g_free(ext);
-    if (!path)
-        path = g_build_filename(dir, base, NULL);
     return path;
 }
 
 static gboolean
 delete_recursive(GFile *file, GError **err)
 {
+    /* Never follow symlinks here: a desktop symlink to a directory must be
+     * deleted as a symlink, not by recursively deleting its target. */
     GFileInfo *info = g_file_query_info(file, G_FILE_ATTRIBUTE_STANDARD_TYPE,
-                                        G_FILE_QUERY_INFO_NONE, NULL, err);
+                                        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, err);
     if (!info)
         return FALSE;
     gboolean ok = TRUE;
     if (g_file_info_get_file_type(info) == G_FILE_TYPE_DIRECTORY) {
         GFileEnumerator *e = g_file_enumerate_children(
             file, G_FILE_ATTRIBUTE_STANDARD_NAME,
-            G_FILE_QUERY_INFO_NONE, NULL, err);
+            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, err);
         if (!e) {
             g_object_unref(info);
             return FALSE;
         }
+        GError *enum_err = NULL;
         GFileInfo *child;
-        while ((child = g_file_enumerator_next_file(e, NULL, err)) != NULL) {
+        while ((child = g_file_enumerator_next_file(e, NULL, &enum_err)) != NULL) {
             const char *name = g_file_info_get_name(child);
             GFile *c = g_file_get_child(file, name);
             if (!delete_recursive(c, err))
@@ -1240,6 +1269,13 @@ delete_recursive(GFile *file, GError **err)
                 break;
         }
         g_object_unref(e);
+        if (enum_err) {
+            ok = FALSE;
+            if (*err)
+                g_error_free(enum_err);
+            else
+                g_propagate_error(err, enum_err);
+        }
     }
     g_object_unref(info);
     if (ok && !g_file_delete(file, NULL, err))
@@ -1250,8 +1286,10 @@ delete_recursive(GFile *file, GError **err)
 static gboolean
 copy_recursive(GFile *src, GFile *dest, GError **err)
 {
+    /* As with delete_recursive(), preserve symlinks instead of copying the
+     * contents of whatever directory they point at. */
     GFileInfo *info = g_file_query_info(src, G_FILE_ATTRIBUTE_STANDARD_TYPE,
-                                        G_FILE_QUERY_INFO_NONE, NULL, err);
+                                        G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, err);
     if (!info)
         return FALSE;
 
@@ -1266,13 +1304,14 @@ copy_recursive(GFile *src, GFile *dest, GError **err)
         }
         GFileEnumerator *e = g_file_enumerate_children(
             src, G_FILE_ATTRIBUTE_STANDARD_NAME,
-            G_FILE_QUERY_INFO_NONE, NULL, err);
+            G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS, NULL, err);
         if (!e) {
             g_object_unref(info);
             return FALSE;
         }
+        GError *enum_err = NULL;
         GFileInfo *child;
-        while ((child = g_file_enumerator_next_file(e, NULL, err)) != NULL) {
+        while ((child = g_file_enumerator_next_file(e, NULL, &enum_err)) != NULL) {
             const char *name = g_file_info_get_name(child);
             GFile *cs = g_file_get_child(src, name);
             GFile *cd = g_file_get_child(dest, name);
@@ -1285,6 +1324,13 @@ copy_recursive(GFile *src, GFile *dest, GError **err)
                 break;
         }
         g_object_unref(e);
+        if (enum_err) {
+            ok = FALSE;
+            if (*err)
+                g_error_free(enum_err);
+            else
+                g_propagate_error(err, enum_err);
+        }
     } else {
         ok = g_file_copy(src, dest,
                          G_FILE_COPY_NOFOLLOW_SYMLINKS | G_FILE_COPY_OVERWRITE,
@@ -1606,6 +1652,11 @@ app_rename_selected(Canvas *c)
 
     char *old_key = g_strdup(ic->key);
     char *old_path = g_strdup(ic->path);
+    /* gtk_dialog_run() spins a nested main loop, during which a pending
+     * reload can free this Icon. Snapshot the fields we need afterwards. */
+    int mx = (!ic->auto_placed && ic->want_x >= 0) ? ic->want_x : ic->x;
+    int my = (!ic->auto_placed && ic->want_y >= 0) ? ic->want_y : ic->y;
+    gboolean auto_placed = ic->auto_placed;
 
     GtkWidget *d = gtk_dialog_new_with_buttons(
         "Rename", NULL, GTK_DIALOG_MODAL,
@@ -1671,9 +1722,7 @@ app_rename_selected(Canvas *c)
         app_show_error(c, "Rename", err ? err->message : "Could not rename the file.");
         g_clear_error(&err);
     } else {
-        int mx = (!ic->auto_placed && ic->want_x >= 0) ? ic->want_x : ic->x;
-        int my = (!ic->auto_placed && ic->want_y >= 0) ? ic->want_y : ic->y;
-        state_move_position(c, old_key, new_name, mx, my, ic->auto_placed);
+        state_move_position(c, old_key, new_name, mx, my, auto_placed);
         app_reload_all();
         canvas_select_key(c, new_name);
         app_save_soon();
@@ -1838,6 +1887,16 @@ launcher_search_changed(GtkEditable *editable, gpointer data)
 }
 
 static void
+launcher_row_activated(GtkTreeView *view, GtkTreePath *path,
+                       GtkTreeViewColumn *column, gpointer data)
+{
+    (void)view;
+    (void)path;
+    (void)column;
+    gtk_dialog_response(GTK_DIALOG(data), GTK_RESPONSE_ACCEPT);
+}
+
+static void
 app_new_launcher(Canvas *c)
 {
     GList *apps = g_app_info_get_all();
@@ -1852,9 +1911,9 @@ app_new_launcher(Canvas *c)
         desktop_apps = g_list_prepend(desktop_apps, ai);
     }
     desktop_apps = g_list_reverse(desktop_apps);
-    g_list_free(apps);
 
     if (!desktop_apps) {
+        g_list_free_full(apps, g_object_unref);
         app_show_error(c, "New Launcher", "No applications were found.");
         return;
     }
@@ -1922,8 +1981,8 @@ app_new_launcher(Canvas *c)
 
     g_signal_connect(search, "search-changed",
                      G_CALLBACK(launcher_search_changed), &lf);
-    g_signal_connect_swapped(view, "row-activated",
-                             G_CALLBACK(gtk_dialog_response), d);
+    g_signal_connect(view, "row-activated",
+                     G_CALLBACK(launcher_row_activated), d);
 
     gtk_widget_show_all(d);
     gtk_widget_grab_focus(search);
@@ -1942,6 +2001,9 @@ app_new_launcher(Canvas *c)
     gtk_widget_destroy(d);
     g_free(lf.needle);
     g_object_unref(store);
+    /* desktop_apps only borrows references owned by apps; release the
+     * GAppInfo objects once the dialog is done with them. */
+    g_list_free_full(apps, g_object_unref);
     g_list_free(desktop_apps);
 
     if (!chosen_id || !chosen_id[0]) {
@@ -1957,6 +2019,8 @@ app_new_launcher(Canvas *c)
     char **parts = g_strsplit(search_dirs, ":", -1);
     for (int i = 0; parts[i] && !source; i++) {
         char *base = expand_home(parts[i]);
+        if (!base)
+            continue;  /* empty XDG_DATA_DIRS component */
         char *cand = g_build_filename(base, "applications", chosen_id, NULL);
         if (g_file_test(cand, G_FILE_TEST_EXISTS))
             source = cand;
@@ -2359,6 +2423,10 @@ canvas_commit_drag(Canvas *c)
 {
     if (!c->drag_moved) {
         c->dragging = FALSE;
+        /* The press-time draw paints selected icons in a second pass, so
+         * without this redraw a plain click leaves that hovering z-order
+         * on screen until some unrelated invalidation happens. */
+        canvas_queue_draw(c);
         return;
     }
     for (guint i = 0; i < c->icons->len; i++) {
@@ -2704,6 +2772,15 @@ show_move_error_idle(gpointer data)
 {
     char *message = data;
     app_show_error(NULL, "Move", message);
+    g_free(message);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean
+show_drop_error_idle(gpointer data)
+{
+    char *message = data;
+    app_show_error(NULL, "Drop", message);
     g_free(message);
     return G_SOURCE_REMOVE;
 }
@@ -3212,7 +3289,9 @@ on_drag_data(GtkWidget *widget, GdkDragContext *context, gint x, gint y,
     }
 
     if (first_error) {
-        app_show_error(c, "Drop", first_error->message);
+        /* Don't run a modal dialog inside drag-data-received: the drag
+         * context is still live and the nested loop can free c. */
+        g_idle_add(show_drop_error_idle, g_strdup(first_error->message));
         g_error_free(first_error);
     }
     if (ok) {
@@ -3323,6 +3402,10 @@ app_destroy_windows(void)
 {
     if (!g_app || !g_app->canvases)
         return;
+    /* A context menu can still be open while canvases are torn down (e.g.
+     * a monitor hotplug rebuild); make sure its callbacks see no Canvas. */
+    g_menu_canvas = NULL;
+    g_clear_pointer(&g_menu_target, g_free);
     app_state_save();
     for (guint i = 0; i < g_app->canvases->len; i++) {
         Canvas *c = g_ptr_array_index(g_app->canvases, i);
@@ -3661,6 +3744,34 @@ ctl_handle_line(App *a, const char *line)
     return handled;
 }
 
+typedef struct {
+    App *a;
+    GSocketConnection *conn;
+    char buf[256];
+} CtlReadCtx;
+
+static void
+ctl_read_done(GObject *source, GAsyncResult *result, gpointer data)
+{
+    CtlReadCtx *ctx = data;
+    GError *err = NULL;
+    gssize n = g_input_stream_read_finish(G_INPUT_STREAM(source), result, &err);
+
+    /* The main loop is gone by the time the App is freed on shutdown, but
+     * ignore any straggler just in case. */
+    if (ctx->a == g_app && n > 0) {
+        ctx->buf[n] = '\0';
+        char **lines = g_strsplit(ctx->buf, "\n", -1);
+        for (int i = 0; lines[i]; i++)
+            ctl_handle_line(ctx->a, lines[i]);
+        g_strfreev(lines);
+    }
+    if (err)
+        g_error_free(err);
+    g_object_unref(ctx->conn);
+    g_free(ctx);
+}
+
 static gboolean
 ctl_incoming(GSocketService *service, GSocketConnection *conn,
              GObject *source_object, gpointer data)
@@ -3668,23 +3779,19 @@ ctl_incoming(GSocketService *service, GSocketConnection *conn,
     (void)service;
     (void)source_object;
     App *a = data;
+
+    /* Do the read asynchronously: a blocking read here would stall the GTK
+     * main loop (and the desktop UI) for up to the old 2s timeout. */
     GSocket *socket = g_socket_connection_get_socket(conn);
-    if (socket) {
-        g_socket_set_blocking(socket, TRUE);
-        g_socket_set_timeout(socket, 2);
-    }
+    if (socket)
+        g_socket_set_blocking(socket, FALSE);
 
+    CtlReadCtx *ctx = g_new0(CtlReadCtx, 1);
+    ctx->a = a;
+    ctx->conn = g_object_ref(conn);
     GInputStream *in = g_io_stream_get_input_stream(G_IO_STREAM(conn));
-    char buf[256];
-    gssize n = g_input_stream_read(in, buf, sizeof(buf) - 1, NULL, NULL);
-    if (n <= 0)
-        return TRUE;
-    buf[n] = '\0';
-
-    char **lines = g_strsplit(buf, "\n", -1);
-    for (int i = 0; lines[i]; i++)
-        ctl_handle_line(a, lines[i]);
-    g_strfreev(lines);
+    g_input_stream_read_async(in, ctx->buf, sizeof(ctx->buf) - 1,
+                              G_PRIORITY_DEFAULT, NULL, ctl_read_done, ctx);
     return TRUE;
 }
 

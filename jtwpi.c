@@ -1086,6 +1086,17 @@ app_arrange_icons(void)
 
 /* ---- drawing ------------------------------------------------------------- */
 
+/* Explicit Pango font options override anything derived from the target
+ * surface, so every glyph renders without antialiasing. */
+static void
+font_antialias_off(PangoLayout *layout)
+{
+    cairo_font_options_t *opts = cairo_font_options_create();
+    cairo_font_options_set_antialias(opts, CAIRO_ANTIALIAS_NONE);
+    pango_cairo_context_set_font_options(pango_layout_get_context(layout), opts);
+    cairo_font_options_destroy(opts);
+}
+
 static void
 draw_icon(cairo_t *cr, Canvas *c, Icon *ic, double dx, double dy)
 {
@@ -1134,6 +1145,7 @@ draw_icon(cairo_t *cr, Canvas *c, Icon *ic, double dx, double dy)
 
     if (ic->name && ic->name[0] && g_app->label_font) {
         PangoLayout *layout = pango_cairo_create_layout(cr);
+        font_antialias_off(layout);
         pango_layout_set_font_description(layout, g_app->label_font);
         pango_layout_set_width(layout, (cw - 10) * PANGO_SCALE);
         pango_layout_set_alignment(layout, PANGO_ALIGN_CENTER);
@@ -4014,6 +4026,17 @@ main(int argc, char **argv)
     a->desktop_file = g_file_new_for_path(a->desktop_dir);
     a->icon_theme = gtk_icon_theme_get_default();
     a->settings = gtk_settings_get_default();
+
+    /* Also disable antialiasing for GTK's own text (menus, tooltips). */
+    if (a->settings)
+        g_object_set(a->settings, "gtk-xft-antialias", (guint)0, NULL);
+    GdkScreen *screen = gdk_screen_get_default();
+    if (screen) {
+        cairo_font_options_t *opts = cairo_font_options_create();
+        cairo_font_options_set_antialias(opts, CAIRO_ANTIALIAS_NONE);
+        gdk_screen_set_font_options(screen, opts);
+        cairo_font_options_destroy(opts);
+    }
 
     a->label_font = pango_font_description_from_string("Sans");
     pango_font_description_set_absolute_size(a->label_font, 11 * PANGO_SCALE);

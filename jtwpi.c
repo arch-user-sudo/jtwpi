@@ -3871,6 +3871,9 @@ static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial,
     if (a->ptr_menu) {
         Menu *m = a->ptr_menu;
         Out *oo = m->out;
+        /* Right/middle clicking a menu row is deliberately inert: no
+         * activation and no dismissal.  Only left click drives the menu. */
+        if (button != BTN_LEFT) return;
         int idx = menu_hit(m, a->ptr_x, a->ptr_y);
         if (button != BTN_LEFT || idx < 0 || !m->items[idx].enabled) {
             if (m->parent && m->parent->items[m->parent_idx].sub == m) {

@@ -421,6 +421,7 @@ static int surf_draw(App *a, Surf *s, int w, int h, int scale,
                      void (*paint)(cairo_t *, int, int, void *), void *data,
                      int *dirty_flag);
 static void surf_cancel(Surf *s);
+static void buf_destroy(App *a, Buf *b);
 static void check_dir(App *a);
 static void ctl_accept(App *a);
 static int  ctl_init(App *a);
@@ -2149,6 +2150,10 @@ static void menu_destroy(Menu *m)
         wl_surface_destroy(m->surf.wl);
         m->surf.wl = NULL;
     }
+    /* The wl_buffer release listeners point at these buffers, so they must
+     * go away with the menu (same as win_close()). */
+    for (int i = 0; i < NBUFS; i++)
+        buf_destroy(m->app, &m->surf.bufs[i]);
     free(m);
 }
 

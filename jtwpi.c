@@ -69,6 +69,9 @@
 #define DEFAULT_ACCENT 0xE8A03C
 #define ACCENT_CONF    "/etc/jt/accent.conf"
 
+/* Shared appearance.conf border-animation toggle (as read by jtlabwc). */
+#define APPEARANCE_CONFIG "appearance.conf"
+
 /* Desktop vignette: a small pre-rendered sprite stretched over the output.
  * Rasterizing a full-screen radial gradient on every repaint is expensive;
  * this soft, low-alpha gradient looks identical when scaled up. */
@@ -373,6 +376,8 @@ struct App {
     char post_dir[PATH_MAX];
     char post_names[64][NAME_MAX + 1];
     int n_post_names, post_armed;
+    /* Shared appearance.conf toggle for all accent-border laps. */
+    int border_anim_enabled;
     /* >0: lap running; -1: lap already played for this batch. */
     double post_sel_anim_start;
 
@@ -916,6 +921,70 @@ static void fs_child(int fd, int op, char (*paths)[PATH_MAX], int n)
     }
     xfer_sendf(fd, "D %d %d", done, failed);
     _exit(failed ? 1 : 0);
+}
+
+static int appearance_config_bool(const char *value)
+{
+    if (!strcasecmp(value, "true")) return 1;
+    if (!strcasecmp(value, "false")) return 0;
+    return 0; /* off unless explicitly enabled */
+}
+
+static void appearance_menu_stop_lap(Menu *m)
+{
+    if (!m) return;
+    m->popup_anim_active = 0;
+    m->popup_anim_start = 0.0;
+    m->dirty = 1;
+    for (int i = 0; i < m->n; i++)
+        appearance_menu_stop_lap(m->items[i].sub);
+}
+
+/* Read ~/.config/jt/appearance.conf with the same keys/default as jtlabwc:
+ * off unless the file says otherwise. */
+static void appearance_config_load(App *a)
+{
+    a->border_anim_enabled = 0;
+    const char *home = getenv("HOME");
+    if (!home || !*home) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/.config/jt/%s", home, APPEARANCE_CONFIG);
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    char line[256];
+    while (fgets(line, sizeof line, file)) {
+        char *text = line;
+        while (*text == ' ' || *text == '\t') text++;
+        char *end = text + strlen(text);
+        while (end > text && (end[-1] == '\n' || end[-1] == '\r' ||
+                              end[-1] == ' ' || end[-1] == '\t'))
+            *--end = '\0';
+        if (!*text || *text == '#') continue;
+        char *key = "";
+        char *value = text;
+        char *equals = strchr(text, '=');
+        if (equals) {
+            *equals = '\0';
+            key = text;
+            value = equals + 1;
+            char *key_end = key + strlen(key);
+            while (key_end > key && (key_end[-1] == ' ' ||
+                                     key_end[-1] == '\t'))
+                *--key_end = '\0';
+            while (*value == ' ' || *value == '\t') value++;
+        }
+        if (!*value) continue;
+        if (!*key || !strcmp(key, "accent_border_animation") ||
+            !strcmp(key, "jtlabwc_border_anim_enabled"))
+            a->border_anim_enabled = appearance_config_bool(value);
+    }
+    fclose(file);
+    if (!a->border_anim_enabled) {
+        a->post_sel_anim_start = -1;
+        for (int i = 0; i < a->n_outs; i++)
+            appearance_menu_stop_lap(a->outs[i].menu);
+        all_mark(a);
+    }
 }
 
 /* ---- accent -------------------------------------------------------------- */
@@ -1706,7 +1775,8 @@ static void paint_vignette(cairo_t *cr, int w, int h)
  * the lap cannot leave us drawing around a stale icon pointer. */
 static int post_sel_icon_pending(const App *a, const DIcon *ic)
 {
-    if (!a || !a->post_armed || !ic || !ic->key) return 0;
+    if (!a || !a->border_anim_enabled || !a->post_armed || !ic || !ic->key)
+        return 0;
     if (a->post_sel_anim_start <= 0.0) return 0;
     for (int k = 0; k < a->n_post_names; k++)
         if (!strcmp(ic->key, a->post_names[k])) return 1;
@@ -1721,7 +1791,8 @@ static double post_sel_elapsed_ms(const App *a)
 
 static int post_sel_anim_active(const App *a)
 {
-    return post_sel_elapsed_ms(a) < SEL_LAP_MS;
+    return a && a->border_anim_enabled &&
+           post_sel_elapsed_ms(a) < SEL_LAP_MS;
 }
 
 /* One accent segment runs clockwise from the bottom centre, all the way
@@ -1786,7 +1857,8 @@ static double menu_popup_elapsed_ms(const Menu *m)
 
 static int menu_popup_anim_active(const Menu *m)
 {
-    return m && m->popup_anim_active && menu_popup_elapsed_ms(m) < SEL_LAP_MS;
+    return m && m->app && m->app->border_anim_enabled &&
+           m->popup_anim_active && menu_popup_elapsed_ms(m) < SEL_LAP_MS;
 }
 
 static int menu_tree_anim_active(const Menu *m)
@@ -1977,9 +2049,16 @@ static void paint_menu(cairo_t *cr, int w, int h, void *data)
     int popup_lap = menu_popup_anim_active(m);
     double popup_progress = popup_lap ? popup_ms / SEL_LAP_MS : 1.0;
 
+    /* Clip the offset shadow to the panel path: otherwise it fills the
+     * transparent wedges outside the bottom rounded corners, which show up
+     * as black artifacts under the popup. */
+    cairo_save(cr);
+    jti_rounded_rect(cr, 0, 0, m->w, m->h, 8);
+    cairo_clip(cr);
     cairo_set_source_rgba(cr, 0, 0, 0, 0.45);
     jti_rounded_rect(cr, 2, 4, m->w, m->h, 8);
     cairo_fill(cr);
+    cairo_restore(cr);
     cairo_pattern_t *g = cairo_pattern_create_linear(0, 0, 0, m->h);
     cairo_pattern_add_color_stop_rgba(g, 0, 0x1A / 255.0, 0x1B / 255.0,
                                       0x1D / 255.0, 0.98);
@@ -2290,7 +2369,7 @@ static void menu_popup_configure(void *data, struct xdg_popup *popup,
 {
     (void)popup; (void)x; (void)y; (void)w; (void)h;
     Menu *m = data;
-    if (!m->configured) {
+    if (!m->configured && m->app && m->app->border_anim_enabled) {
         m->popup_anim_start = now_sec();
         m->popup_anim_active = 1;
     }
@@ -3397,7 +3476,8 @@ static void action_run(Out *o, int id, int arg)
         for (int i = 0; i < a->n_clip && n < 64; i++)
             snprintf(names[n++], NAME_MAX + 1, "%s", path_base(a->clip[i]));
         post_sel_arm(a, a->desktop_dir, names, n);
-        if (a->post_armed) a->post_sel_anim_start = now_sec();
+        if (a->border_anim_enabled && a->post_armed)
+            a->post_sel_anim_start = now_sec();
         break;
     }
     case ACT_PASTE: {
@@ -5357,6 +5437,7 @@ static void ctl_handle(App *a, const char *line, int *quit)
     trim(buf);
     if (!*buf) return;
     if (!strcmp(buf, "quit")) { *quit = 1; return; }
+    if (!strcmp(buf, "reload")) { appearance_config_load(a); return; }
     const char *c = buf;
     if (!strncmp(c, "accent", 6)) {
         c += 6;
@@ -5499,9 +5580,11 @@ int main(int argc, char **argv)
     a->ctl_fd = -1;
     a->xfer.fd = -1;
     a->clip_read.fd = -1;
+    a->border_anim_enabled = 0;
     a->accent = DEFAULT_ACCENT;
     jti_palette_set(&a->pal, a->accent);
 
+    appearance_config_load(a);
     /* Accent: config file first, CLI overrides. */
     accent_load_default(a);
     for (int i = 1; i < argc; i++) {
@@ -5626,7 +5709,8 @@ int main(int argc, char **argv)
             int ms = left <= 0.0 ? 0 : (int)(left * 1000.0);
             if (ms < timeout_ms) timeout_ms = ms;
         }
-        if (a->post_sel_anim_start > 0.0 && SEL_LAP_TICK_MS < timeout_ms)
+        if (a->border_anim_enabled && a->post_sel_anim_start > 0.0 &&
+            SEL_LAP_TICK_MS < timeout_ms)
             timeout_ms = SEL_LAP_TICK_MS;
         for (int i = 0; i < a->n_outs; i++)
             if (menu_tree_anim_active(a->outs[i].menu) &&
@@ -5673,7 +5757,7 @@ int main(int argc, char **argv)
         /* Drive the post-drop lap off the presentation clock.  Every tick
          * marks the outputs so surf_draw() reuses the pending frame callback
          * and paints the segment at its current perimeter position. */
-        if (a->post_sel_anim_start > 0.0) {
+        if (a->border_anim_enabled && a->post_sel_anim_start > 0.0) {
             if (post_sel_elapsed_ms(a) > SEL_LAP_MS)
                 a->post_sel_anim_start = -1; /* lap played for this batch */
             all_mark(a);

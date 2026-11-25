@@ -2020,18 +2020,14 @@ static int menu_hit(Menu *m, double mx, double my)
     return -1;
 }
 
-/* Same nested-popup behavior as jtlabwc: moving to another row closes the
- * current submenu, and hovering a submenu row opens it on the row anchor. */
+/* Hover only selects a row.  A submenu opens on click/Enter, and moving to
+ * another row closes whatever submenu was open. */
 static void menu_pointer_update(Menu *m, double mx, double my)
 {
     int hit = menu_hit(m, mx, my);
     if (hit == m->hover) return;
     if (m->sub) menu_close(m->sub);
     m->hover = hit;
-    if (hit >= 0 && m->items[hit].kind == MI_SUB && m->items[hit].enabled) {
-        menu_open_size_sub(m->out, m, hit,
-                           m->w - MENU_INSET, menu_item_offset_y(m, hit));
-    }
     m->dirty = 1;
 }
 

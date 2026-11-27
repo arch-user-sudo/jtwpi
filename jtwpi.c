@@ -9,11 +9,13 @@
  * Run:   ./jtwpi                       desktop layer
  *        ./jtwpi '#RRGGBB'             initial accent override
  *        ./jtwpi --accent '#RRGGBB'
+ *        ./jtwpi rainbow             cycle the accent (or --rainbow)
  *        ./jtwpi --desktop ~/Desktop
  *        ./jtwpi --hidden
  *
- * $XDG_RUNTIME_DIR/jtwpi-ctl.sock accepts "accent #RRGGBB", "#RRGGBB" and
- * "quit" (see jtwpictl).  The accent is also read from /etc/jt/accent.conf
+ * $XDG_RUNTIME_DIR/jtwpi-ctl.sock accepts "accent #RRGGBB", "#RRGGBB",
+ * "rainbow [on|off|toggle]" and "quit" (see jtwpictl).  The accent is also
+ * read from /etc/jt/accent.conf
  * at startup so the first frame already matches the rest of the desktop.
  */
 #define _GNU_SOURCE
@@ -84,6 +86,9 @@
 #define SEL_LAP_WIDTH    3.0
 #define SEL_LAP_MIN_SEG  14.0
 #define SEL_LAP_MAX_SEG  48.0
+
+/* Rainbow mode: one hue wheel every eight seconds, repolled at this rate. */
+#define RAINBOW_TICK_MS  100
 
 #define MAX_OUTPUTS   8
 #define MAX_ICONS     1024
@@ -359,6 +364,11 @@ struct App {
 
     JtiPalette pal;
     unsigned accent;
+    /* Rainbow cycles the accent; off restores the exact base colour so an
+     * explicit accent is never lost. */
+    unsigned accent_base_rgb;
+    int rainbow_mode;
+    double rainbow_start;
 
     char *desktop_dir;
     char *state_path;
@@ -1011,6 +1021,66 @@ static void accent_set(App *a, unsigned rgb)
     }
 }
 
+/* One full hue wheel every eight seconds, as a saturated RGB triple.
+ * t is seconds since rainbow mode was switched on. */
+static unsigned rainbow_color(double t)
+{
+    double phase = fmod(t, 8.0);
+    if (phase < 0.0)
+        phase += 8.0;
+    double h = phase * 0.75;
+    int i = (int)h;
+    double f = h - i;
+    double q = 1.0 - f;
+    double r = 0.0, g = 0.0, b = 0.0;
+    switch (i) {
+    case 0: r = 1.0; g = f;   b = 0.0; break;
+    case 1: r = q;   g = 1.0; b = 0.0; break;
+    case 2: r = 0.0; g = 1.0; b = f;   break;
+    case 3: r = 0.0; g = q;   b = 1.0; break;
+    case 4: r = f;   g = 0.0; b = 1.0; break;
+    default:r = 1.0; g = 0.0; b = q;   break;
+    }
+    return ((unsigned)lround(r * 255.0) << 16) |
+           ((unsigned)lround(g * 255.0) << 8) |
+           (unsigned)lround(b * 255.0);
+}
+
+/* Outside rainbow mode every colour change is also a new base colour. */
+static void accent_apply(App *a, unsigned rgb)
+{
+    if (!a->rainbow_mode)
+        a->accent_base_rgb = rgb;
+    accent_set(a, rgb);
+}
+
+static void rainbow_set(App *a, int on, double t)
+{
+    int was_on = a->rainbow_mode;
+    a->rainbow_mode = on ? 1 : 0;
+    if (a->rainbow_mode) {
+        if (!was_on) {
+            a->rainbow_start = t;
+            accent_apply(a, rainbow_color(0.0));
+        }
+    } else if (was_on) {
+        accent_apply(a, a->accent_base_rgb);
+    }
+}
+
+/* Returns 1 only when the displayed hue changed; accent_set() already marks
+ * the outputs dirty and drops cached icon surfaces in that case. */
+static int accent_tick(App *a, double t)
+{
+    if (!a->rainbow_mode)
+        return 0;
+    unsigned rgb = rainbow_color(t - a->rainbow_start);
+    if (rgb == a->accent)
+        return 0;
+    accent_apply(a, rgb);
+    return 1;
+}
+
 static void accent_load_default(App *a)
 {
     FILE *f = fopen(ACCENT_CONF, "r");
@@ -1019,7 +1089,7 @@ static void accent_load_default(App *a)
     if (fgets(buf, sizeof buf, f)) {
         trim(buf);
         unsigned rgb;
-        if (accent_parse(buf, &rgb)) accent_set(a, rgb);
+        if (accent_parse(buf, &rgb)) accent_apply(a, rgb);
     }
     fclose(f);
 }
@@ -5442,13 +5512,32 @@ static void ctl_handle(App *a, const char *line, int *quit)
     if (!*buf) return;
     if (!strcmp(buf, "quit")) { *quit = 1; return; }
     if (!strcmp(buf, "reload")) { appearance_config_load(a); return; }
+    if (!strncmp(buf, "rainbow", 7) &&
+        (buf[7] == '\0' || buf[7] == ' ' || buf[7] == '\t')) {
+        const char *arg = buf + 7;
+        while (*arg == ' ' || *arg == '\t') arg++;
+        int on;
+        if (!*arg || !strcmp(arg, "toggle"))
+            on = !a->rainbow_mode;      /* bare command toggles */
+        else if (!strcmp(arg, "on"))
+            on = 1;
+        else if (!strcmp(arg, "off"))
+            on = 0;
+        else
+            return;
+        rainbow_set(a, on, now_sec());
+        return;
+    }
     const char *c = buf;
     if (!strncmp(c, "accent", 6)) {
         c += 6;
         while (*c == ' ' || *c == '\t') c++;
     }
     unsigned rgb;
-    if (accent_parse(c, &rgb)) accent_set(a, rgb);
+    if (accent_parse(c, &rgb)) {
+        a->rainbow_mode = 0; /* an explicit colour takes over */
+        accent_apply(a, rgb);
+    }
 }
 
 static void ctl_accept(App *a)
@@ -5535,9 +5624,10 @@ static void usage(const char *p)
         "  --desktop PATH       Desktop directory (default: XDG desktop dir)\n"
         "  --icon-size N        Icon size, 24-128 (default %d)\n"
         "  --accent COLOR       Initial accent #RRGGBB\n"
+        "  --rainbow            Cycle the accent through the hue wheel\n"
         "  --hidden             Start with desktop icons hidden\n"
         "  --version, --help\n"
-        "Live accent/quit: $XDG_RUNTIME_DIR/jtwpi-ctl.sock (see jtwpictl)\n",
+        "Live accent/rainbow/quit: $XDG_RUNTIME_DIR/jtwpi-ctl.sock (see jtwpictl)\n",
         p, DEFAULT_ICON_SIZE);
 }
 
@@ -5586,6 +5676,7 @@ int main(int argc, char **argv)
     a->clip_read.fd = -1;
     a->border_anim_enabled = 0;
     a->accent = DEFAULT_ACCENT;
+    a->accent_base_rgb = DEFAULT_ACCENT;
     jti_palette_set(&a->pal, a->accent);
 
     appearance_config_load(a);
@@ -5594,6 +5685,12 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         const char *val = NULL;
         int consumed = 0;
+        if (!strcmp(argv[i], "--rainbow") || !strcmp(argv[i], "rainbow")) {
+            rainbow_set(a, 1, now_sec());
+            for (int j = i; j + 1 < argc; j++) argv[j] = argv[j + 1];
+            argc--; i--;
+            continue;
+        }
         if (!strcmp(argv[i], "--accent")) {
             if (i + 1 >= argc) { usage(argv[0]); return 1; }
             val = argv[++i]; consumed = 1;
@@ -5611,11 +5708,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "%s: invalid accent color '%s'\n", argv[0], val);
             return 1;
         }
-        accent_set(a, rgb);
+        a->rainbow_mode = 0; /* an explicit colour takes over */
+        accent_apply(a, rgb);
         for (int j = i; j + consumed < argc; j++) argv[j] = argv[j + consumed];
         argc -= consumed; i--;
     }
-
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--version")) {
             printf("%s %s\n", APP_NAME, APP_VERSION); return 0;
@@ -5713,6 +5810,8 @@ int main(int argc, char **argv)
             int ms = left <= 0.0 ? 0 : (int)(left * 1000.0);
             if (ms < timeout_ms) timeout_ms = ms;
         }
+        if (a->rainbow_mode && RAINBOW_TICK_MS < timeout_ms)
+            timeout_ms = RAINBOW_TICK_MS;
         if (a->border_anim_enabled && a->post_sel_anim_start > 0.0 &&
             SEL_LAP_TICK_MS < timeout_ms)
             timeout_ms = SEL_LAP_TICK_MS;
@@ -5742,6 +5841,9 @@ int main(int argc, char **argv)
             if (re & (POLLOUT | POLLERR | POLLHUP | POLLNVAL))
                 clip_write_poll(a, fds[write_idx[i]].fd);
         }
+        /* Advance the hue wheel; accent_set() marks the outputs dirty so the
+         * paint below picks up the new colour on the next frame callback. */
+        if (a->rainbow_mode) accent_tick(a, now_sec());
 
         /* The compositor ends the popup grab (and sends popup_done) when a
          * button is pressed outside any of our menu surfaces. */

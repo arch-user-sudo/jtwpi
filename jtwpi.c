@@ -99,6 +99,9 @@
 #define BTN_LEFT  0x110
 #define BTN_RIGHT 0x111
 
+/* Same destructive-action colour as jtfiles' confirmation dialog. */
+#define C_DANGER  0xE0685E
+
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
@@ -305,6 +308,9 @@ typedef struct ClipWrite {
     size_t len, off;
 } ClipWrite;
 
+/* What is under an active drop point. */
+enum { DND_DROP_NONE, DND_DROP_FILE, DND_DROP_DIR, DND_DROP_NOOP };
+
 struct App {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -334,9 +340,13 @@ struct App {
     uint32_t dnd_action;                    /* negotiated drag action (source) */
     uint32_t dnd_offer_action;              /* action reported by wl_data_offer.action */
     int dnd_have_gnome;                     /* incoming drag cut/copy verb */
+    int dnd_actions_set;                    /* source actions advertised once per drag */
+    int dnd_ctrl, dnd_shift;                /* live Windows-style drag modifiers */
     Out *dnd_src_out;                       /* output where drag started */
     Out *dnd_drop_out;                      /* internal drop target */
     double dnd_drop_x, dnd_drop_y;          /* internal drop position */
+    int dnd_drop_kind;                      /* current drop target, see DND_DROP_* */
+    char dnd_drop_dir[PATH_MAX];            /* directory the drop would land in */
 
     /* Wayland clipboard (wl_data_device selection) */
     struct wl_data_source *clip_source;     /* we own the selection */
@@ -434,6 +444,14 @@ static void surf_cancel(Surf *s);
 static void buf_destroy(App *a, Buf *b);
 static void check_dir(App *a);
 static void ctl_accept(App *a);
+static uint32_t dnd_decide_action(App *a, const char *src, const char *dst);
+static void dnd_modifiers_snapshot(App *a);
+static void dnd_source_update_actions(App *a);
+static void dnd_offer_update_actions(App *a);
+static DIcon *dnd_drop_target(App *a, Out *src, Out *dst);
+static DIcon *dnd_icon_at(Out *o, double x, double y);
+static void dnd_target_refresh(App *a);
+static int dnd_path_within(const char *path, const char *dir);
 static int  ctl_init(App *a);
 static void clipboard_publish(App *a);
 static int  clipboard_fetch(App *a, int *cut);
@@ -668,6 +686,99 @@ static void unique_path(const char *dir, const char *base, char *out, size_t n)
             snprintf(out, n, "%s/%s-%d", dir, base, i);
         if (access(out, F_OK) != 0) return;
     }
+}
+
+/* Windows Explorer rules: Ctrl copies, Shift moves, otherwise move within one
+ * filesystem and copy across filesystems.  An offer from another client has no
+ * source paths until its URI list is read, so its pre-read default is copy. */
+static uint32_t dnd_decide_action(App *a, const char *src, const char *dst)
+{
+    if (a->dnd_ctrl && !a->dnd_shift)
+        return WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    if (a->dnd_shift && !a->dnd_ctrl)
+        return WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    if (src && *src && dst && *dst) {
+        struct stat ss, ds;
+        if (stat(src, &ss) == 0 && stat(dst, &ds) == 0)
+            return ss.st_dev == ds.st_dev
+                       ? WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE
+                       : WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    }
+    return WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+}
+
+static const char *dnd_first_src_path(App *a)
+{
+    if (!a->dnd_src_out) return NULL;
+    for (int i = 0; i < a->dnd_src_out->n; i++) {
+        DIcon *ic = &a->dnd_src_out->icons[i];
+        if (ic->selected && ic->x >= 0) return ic->path;
+    }
+    return NULL;
+}
+
+static void dnd_modifiers_snapshot(App *a)
+{
+    if (!a->xkb_state) {
+        a->dnd_ctrl = a->dnd_shift = 0;
+        return;
+    }
+    a->dnd_ctrl = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_CTRL,
+                                               XKB_STATE_MODS_EFFECTIVE) > 0;
+    a->dnd_shift = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_SHIFT,
+                                                XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+/* wlroots rejects a second set_actions, and rejects changes after start_drag.
+ * Advertise both supported actions once; the target chooses from live state. */
+static void dnd_source_update_actions(App *a)
+{
+    if (a->dnd_actions_set || !a->dnd_source ||
+        wl_data_source_get_version(a->dnd_source) <
+            WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION)
+        return;
+    wl_data_source_set_actions(a->dnd_source,
+        WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+        WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+    a->dnd_actions_set = 1;
+}
+
+static void dnd_offer_update_actions(App *a)
+{
+    if (!a->dnd_offer || !a->dnd_accepted ||
+        wl_data_offer_get_version(a->dnd_offer) <
+            WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
+        return;
+    uint32_t supported = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                         WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    uint32_t preferred;
+    if (a->dnd_drop_kind == DND_DROP_FILE || a->dnd_drop_kind == DND_DROP_NOOP) {
+        supported = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+        preferred = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    } else {
+        preferred = dnd_decide_action(a, dnd_first_src_path(a),
+                    a->dnd_drop_dir[0] ? a->dnd_drop_dir : a->desktop_dir);
+    }
+    wl_data_offer_set_actions(a->dnd_offer, supported, preferred);
+}
+
+static void dnd_target_refresh(App *a)
+{
+    DIcon *ic = dnd_drop_target(a, a->dnd_source ? a->dnd_src_out : NULL,
+                                a->dnd_drop_out);
+    int kind = ic ? (ic->is_dir ? DND_DROP_DIR : DND_DROP_FILE) : DND_DROP_NONE;
+    if (kind == DND_DROP_NONE && a->dnd_source && a->dnd_drop_out &&
+        dnd_icon_at(a->dnd_drop_out, a->dnd_drop_x, a->dnd_drop_y))
+        kind = DND_DROP_NOOP;   /* one of the dragged icons */
+    char dir[PATH_MAX] = { 0 };
+    if (kind == DND_DROP_DIR)
+        snprintf(dir, sizeof dir, "%s", ic->path);
+    else
+        snprintf(dir, sizeof dir, "%s", a->desktop_dir ? a->desktop_dir : "");
+    a->dnd_drop_kind = kind;
+    snprintf(a->dnd_drop_dir, sizeof a->dnd_drop_dir, "%s", dir);
+    dnd_offer_update_actions(a);
+    dnd_source_update_actions(a);
 }
 
 /* ---- transfer worker helpers (run in the re-exec'd child) ----------------- */
@@ -2811,12 +2922,13 @@ static void paint_dialog(cairo_t *cr, int w, int h, void *data)
                   JTI_ALIGN_CENTER, 0.0);
     jti_rounded_rect(cr, dw - 22 - bw, by, bw, 32, 6);
     if (d->kind == DLG_CONFIRM)
-        cairo_set_source_rgba(cr, 0.78, 0.20, 0.20, 1);
+        jti_rgba(cr, C_DANGER, 1.0);
     else
         cairo_set_source_rgba(cr, JTI_R(a->pal.accent), JTI_G(a->pal.accent),
                               JTI_B(a->pal.accent), 1);
     cairo_fill(cr);
-    jti_text_draw(cr, ok, 12, 600, a->pal.on_accent, 1.0,
+    jti_text_draw(cr, ok, 12, 600,
+                  d->kind == DLG_CONFIRM ? a->pal.fg : a->pal.on_accent, 1.0,
                   dw - 22 - bw / 2.0, by + 8, JTI_ALIGN_CENTER, 0.0);
 }
 
@@ -4098,6 +4210,9 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *kb,
     a->mods_dep = dep; a->mods_lat = lat; a->mods_lock = lock; a->mods_group = group;
     if (a->xkb_state)
         xkb_state_update_mask(a->xkb_state, dep, lat, lock, 0, 0, group);
+    dnd_modifiers_snapshot(a);
+    dnd_source_update_actions(a);
+    dnd_offer_update_actions(a);
 }
 
 static void menu_key(Out *o, Menu *m, xkb_keysym_t sym)
@@ -4160,6 +4275,11 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial,
     App *a = data;
     post_sel_disarm(a);
     a->clip_serial = serial;
+    if (a->xkb_state) {
+        dnd_modifiers_snapshot(a);
+        dnd_source_update_actions(a);
+        dnd_offer_update_actions(a);
+    }
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
     if (!a->xkb_state) return;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
@@ -4788,6 +4908,7 @@ static void dnd_source_cancelled(void *data, struct wl_data_source *source)
     if (a->dnd_source == source) {
         wl_data_source_destroy(source);
         a->dnd_source = NULL;
+        a->dnd_actions_set = 0;
     }
     dnd_icon_destroy(a);
     a->dnd_src_out = NULL;
@@ -4803,6 +4924,7 @@ static void dnd_source_finished(void *data, struct wl_data_source *source)
     if (a->dnd_source == source) {
         wl_data_source_destroy(source);
         a->dnd_source = NULL;
+        a->dnd_actions_set = 0;
     }
     dnd_icon_destroy(a);
     a->dnd_src_out = NULL;
@@ -4892,17 +5014,18 @@ static void dnd_begin(App *a, Out *o)
     wl_data_source_offer(src, "text/uri-list");
     wl_data_source_offer(src, "x-special/gnome-copied-files");
     wl_data_source_offer(src, "text/plain;charset=utf-8");
-    if (wl_data_source_get_version(src) >= WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION)
-        wl_data_source_set_actions(src,
-            WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
-            WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
     a->dnd_source = src;
+    a->dnd_actions_set = 0;
     a->dnd_pending = 0;
     a->dnd_action = 0;
-
-    struct wl_surface *icon = dnd_icon_create(a, o);
     a->dnd_src_out = o;
     a->dnd_drop_out = NULL;
+    a->dnd_drop_kind = DND_DROP_NONE;
+    a->dnd_drop_dir[0] = 0;
+    dnd_modifiers_snapshot(a);
+    dnd_source_update_actions(a);
+
+    struct wl_surface *icon = dnd_icon_create(a, o);
     wl_data_device_start_drag(a->data_device, src, o->surf.wl, icon,
                               a->dnd_press_serial);
     wl_display_flush(a->display);
@@ -4914,16 +5037,19 @@ static void dnd_begin(App *a, Out *o)
     out_mark(o);
 }
 
-/* ---- incoming drag: copy files to the desktop ---- */
+/* ---- incoming drag: copy/move files to a folder or the desktop ---- */
 
-static int dnd_receive_uris(App *a, struct wl_data_offer *offer)
+static int dnd_receive_uris(App *a, struct wl_data_offer *offer,
+                            const char *dest_dir, int *did_move)
 {
+    if (did_move) *did_move = 0;
     /* Snapshot the drop target before the blocking pipe read; the data
-     * device keep the offer alive until drop returns, but being explicit
+     * device keeps the offer alive until drop returns, but being explicit
      * avoids depending on that detail. */
     Out *dst = a->dnd_drop_out;
     int have_drop = dst && dst->width > 0 && dst->height > 0;
     double drop_x = a->dnd_drop_x, drop_y = a->dnd_drop_y;
+    int desktop_drop = !dest_dir || !strcmp(dest_dir, a->desktop_dir);
 
     const char *mime = a->dnd_have_gnome ? "x-special/gnome-copied-files"
                                          : "text/uri-list";
@@ -4945,50 +5071,69 @@ static int dnd_receive_uris(App *a, struct wl_data_offer *offer)
     close(p[0]);
     buf[len] = 0;
 
-    /* "cut" in the gnome target means move.  We do the move ourselves, so
-     * the source app never needs to delete the originals after the drop. */
-    int cut = 0;
+    /* Skip the gnome cut/copy verb.  The action comes from the Windows rules
+     * and the paths just received, not from the source's advertised verb. */
     char *lines = buf;
     if (a->dnd_have_gnome) {
         char *nl = strchr(buf, '\n');
-        if (nl) {
-            *nl = 0;
-            cut = !strcmp(buf, "cut") || !strncmp(buf, "cut\r", 4);
-            lines = nl + 1;
-        }
+        if (nl) lines = nl + 1;
     }
 
-    char copied[64][NAME_MAX + 1];
-    int ncopied = 0;
+    char sources[64][PATH_MAX];
+    int ns = 0;
     char *save = NULL;
     for (char *line = strtok_r(lines, "\r\n", &save);
-         line && ncopied < 64; line = strtok_r(NULL, "\r\n", &save)) {
+         line && ns < 64; line = strtok_r(NULL, "\r\n", &save)) {
         if (!*line || *line == '#') continue;
         char path[PATH_MAX];
         dnd_uri_to_path(line, path, sizeof path);
         if (!*path || access(path, F_OK) != 0) continue;
+        snprintf(sources[ns++], PATH_MAX, "%s", path);
+    }
+    if (!ns) return 0;
+
+    const char *dst_dir = dest_dir && *dest_dir ? dest_dir : a->desktop_dir;
+    int move = dnd_decide_action(a, sources[0], dst_dir) ==
+               WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    char copied[64][NAME_MAX + 1];
+    int ncopied = 0;
+    for (int i = 0; i < ns; i++) {
+        const char *path = sources[i];
+        /* Avoid recursive copies when a folder is dropped into itself. */
+        if (!desktop_drop && dnd_path_within(dst_dir, path)) continue;
         char target[PATH_MAX];
-        unique_path(a->desktop_dir, path_base(path), target, sizeof target);
+        unique_path(dst_dir, path_base(path), target, sizeof target);
         if (!strcmp(path, target)) continue;
-        if (cut) {
-            if (rename(path, target) != 0) {
+        int ok = 0;
+        if (move) {
+            if (rename(path, target) == 0) {
+                ok = 1;
+            } else if (errno == EXDEV) {
                 copy_recursive(path, target);
-                if (access(target, F_OK) == 0) remove_tree(path);
+                if (access(target, F_OK) == 0) {
+                    remove_tree(path);
+                    ok = 1;
+                }
             }
         } else {
             copy_recursive(path, target);
+            ok = access(target, F_OK) == 0;
         }
+        if (!ok) continue;
         snprintf(copied[ncopied++], sizeof copied[0], "%s", path_base(target));
     }
     if (!ncopied) return 0;
+    if (did_move) *did_move = move;
 
-    post_sel_arm(a, a->desktop_dir, copied, ncopied);
+    if (desktop_drop)
+        post_sel_arm(a, a->desktop_dir, copied, ncopied);
 
     /* Every output shows the same desktop directory, so refresh them all;
-     * only the output the files were dropped on gets the explicit position. */
+     * a folder drop can still remove desktop icons when sources came from
+     * here. */
     for (int i = 0; i < a->n_outs; i++) out_load_icons(&a->outs[i], 1);
 
-    if (have_drop) {
+    if (desktop_drop && have_drop) {
         place_new_icons(a, dst, copied, ncopied, drop_x, drop_y);
     } else {
         state_save(a);
@@ -5024,18 +5169,30 @@ static DIcon *dnd_drop_target(App *a, Out *src, Out *dst)
     return NULL;
 }
 
+/* First icon under a point, including icons that are part of the drag. */
+static DIcon *dnd_icon_at(Out *o, double x, double y)
+{
+    if (!o || !g_app->show_icons) return NULL;
+    int cw = cell_w(), ch = cell_h();
+    for (int i = o->n - 1; i >= 0; i--) {
+        DIcon *ic = &o->icons[i];
+        if (ic->x < 0 || ic->y < 0) continue;
+        if (x >= ic->x && x < ic->x + cw && y >= ic->y && y < ic->y + ch)
+            return ic;
+    }
+    return NULL;
+}
+
 static int dnd_path_within(const char *path, const char *dir)
 {
     size_t n = strlen(dir);
     return !strncmp(path, dir, n) && (path[n] == '\0' || path[n] == '/');
 }
 
-/* Move the dragged desktop icons into the folder they were dropped on. */
-static int dnd_move_into_folder(App *a, Out *src, DIcon *folder,
-                                char *first_path, size_t first_n)
+/* Copy or move the dragged desktop icons into the folder they landed on. */
+static int dnd_transfer_into_folder(App *a, Out *src, const char *folder_path,
+                                    int move, char *first_path, size_t first_n)
 {
-    char folder_path[PATH_MAX];
-    snprintf(folder_path, sizeof folder_path, "%s", folder->path);
     char moved_keys[64][256];
     char moved_paths[64][PATH_MAX];
     int n = 0;
@@ -5050,14 +5207,19 @@ static int dnd_move_into_folder(App *a, Out *src, DIcon *folder,
         if (!strcmp(ic->path, dst)) continue;
 
         int ok = 0;
-        if (rename(ic->path, dst) == 0) {
-            ok = 1;
-        } else if (errno == EXDEV) {
-            copy_recursive(ic->path, dst);
-            if (access(dst, F_OK) == 0) {
-                remove_tree(ic->path);
+        if (move) {
+            if (rename(ic->path, dst) == 0) {
                 ok = 1;
+            } else if (errno == EXDEV) {
+                copy_recursive(ic->path, dst);
+                if (access(dst, F_OK) == 0) {
+                    remove_tree(ic->path);
+                    ok = 1;
+                }
             }
+        } else {
+            copy_recursive(ic->path, dst);
+            ok = access(dst, F_OK) == 0;
         }
         if (!ok) continue;
 
@@ -5068,15 +5230,17 @@ static int dnd_move_into_folder(App *a, Out *src, DIcon *folder,
     if (!n) return 0;
     snprintf(first_path, first_n, "%s", moved_paths[0]);
 
-    /* Forget the old desktop cells before reloading, otherwise a later
-     * file with the same name could inherit this icon's saved position. */
-    char sec[160];
-    for (int k = 0; k < n; k++)
-        for (int i = 0; i < a->n_outs; i++) {
-            if (!a->outs[i].key[0]) continue;
-            state_mon_section(a->outs[i].key, sec, sizeof sec);
-            state_set(sec, moved_keys[k], "");
-        }
+    /* A moved icon's old cell must be forgotten before reloading, otherwise
+     * a later file with the same name could inherit its saved position. */
+    if (move) {
+        char sec[160];
+        for (int k = 0; k < n; k++)
+            for (int i = 0; i < a->n_outs; i++) {
+                if (!a->outs[i].key[0]) continue;
+                state_mon_section(a->outs[i].key, sec, sizeof sec);
+                state_set(sec, moved_keys[k], "");
+            }
+    }
 
     for (int i = 0; i < a->n_outs; i++) out_load_icons(&a->outs[i], 1);
     state_save(a);
@@ -5084,8 +5248,30 @@ static int dnd_move_into_folder(App *a, Out *src, DIcon *folder,
     return n;
 }
 
-/* Reposition the dragged desktop icons to the internal drop cell. */
-static void dnd_internal_drop(App *a)
+/* Ctrl+drag on the desktop background creates copies instead of moving the
+ * icons to the drop cell. */
+static void dnd_copy_on_desktop(App *a, Out *src, Out *dst, double px, double py)
+{
+    char names[64][NAME_MAX + 1];
+    int n = 0;
+    for (int i = 0; i < src->n && n < 64; i++) {
+        DIcon *ic = &src->icons[i];
+        if (!ic->selected || ic->x < 0) continue;
+        char target[PATH_MAX];
+        unique_path(a->desktop_dir, path_base(ic->path), target, sizeof target);
+        if (!strcmp(ic->path, target)) continue;
+        copy_recursive(ic->path, target);
+        if (access(target, F_OK) != 0) continue;
+        snprintf(names[n++], sizeof names[0], "%s", path_base(target));
+    }
+    if (!n) return;
+    post_sel_arm(a, a->desktop_dir, names, n);
+    for (int i = 0; i < a->n_outs; i++) out_load_icons(&a->outs[i], 1);
+    place_new_icons(a, dst, names, n, px, py);
+}
+
+/* Apply the internal drop using the target chosen at drop time. */
+static void dnd_internal_drop(App *a, int kind, const char *dir)
 {
     Out *src = a->dnd_src_out;    /* where the icons came from */
     /* Normally enter() sets this to our surface. If the compositor did not
@@ -5097,24 +5283,33 @@ static void dnd_internal_drop(App *a)
     out_clear_hover(src);
     if (dst != src) out_clear_hover(dst);
 
-    DIcon *target = dnd_drop_target(a, src, dst);
-    if (target && target->is_dir) {
+    if (kind == DND_DROP_DIR && dir && *dir) {
+        int move = dnd_decide_action(a, dnd_first_src_path(a), dir) ==
+                   WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
         char selected[PATH_MAX];
-        if (dnd_move_into_folder(a, src, target, selected, sizeof selected)) {
-            /* jtfiles is the default folder opener and now understands
-             * --select, so open the destination with the moved file lit. */
+        if (dnd_transfer_into_folder(a, src, dir, move,
+                                     selected, sizeof selected)) {
+            /* jtfiles is the default folder opener and understands --select. */
             const char *av[] = { "jtfiles", "--select", selected, NULL };
             spawn_detached(av);
         }
         return;
     }
-    if (target) {
-        /* Dropped on a non-folder icon.  The compositor drag never changed
-         * the desktop cells, so leaving them alone makes the file snap back. */
+    if (kind == DND_DROP_FILE || kind == DND_DROP_NOOP) {
+        /* Dropped on a non-folder icon or one of the dragged icons.  The
+         * compositor drag never changed the desktop cells, so snap back. */
         out_mark(src);
         if (src != dst) out_mark(dst);
         return;
     }
+
+    int move = dnd_decide_action(a, dnd_first_src_path(a), a->desktop_dir) ==
+               WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    if (!move) {
+        dnd_copy_on_desktop(a, src, dst, a->dnd_drop_x, a->dnd_drop_y);
+        return;
+    }
+
     /* Keep the pointer's offset inside the first dragged icon so the group
      * lands where the user dropped it rather than jumping to the cell origin. */
     DIcon *anchor = NULL;
@@ -5253,6 +5448,10 @@ static void dnd_data_device_enter(void *data, struct wl_data_device *device,
     a->dnd_enter_serial = serial;
     a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
     a->dnd_drop_out = NULL;
+    a->dnd_drop_kind = DND_DROP_NONE;
+    a->dnd_drop_dir[0] = 0;
+    a->dnd_drop_x = wl_fixed_to_double(x);
+    a->dnd_drop_y = wl_fixed_to_double(y);
     if (!ctx) return;
     /* Mime events were delivered before enter(); use what we recorded. */
     a->dnd_accept = ctx->uris || ctx->gnome;
@@ -5262,22 +5461,16 @@ static void dnd_data_device_enter(void *data, struct wl_data_device *device,
         wl_data_offer_accept(offer, serial, a->dnd_have_gnome
                              ? "x-special/gnome-copied-files" : "text/uri-list");
         a->dnd_accepted = 1;
-        if (wl_data_offer_get_version(offer) >= WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
-            wl_data_offer_set_actions(offer,
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
     }
-    data_offer_prune(a, ctx);
     /* Is this drag entering one of our own desktop surfaces? */
     for (int i = 0; i < a->n_outs; i++) {
         if (a->outs[i].surf.wl == surface) {
             a->dnd_drop_out = &a->outs[i];
-            a->dnd_drop_x = wl_fixed_to_double(x);
-            a->dnd_drop_y = wl_fixed_to_double(y);
             break;
         }
     }
+    dnd_target_refresh(a);
+    data_offer_prune(a, ctx);
 }
 
 static void dnd_data_device_motion(void *data, struct wl_data_device *device,
@@ -5287,6 +5480,7 @@ static void dnd_data_device_motion(void *data, struct wl_data_device *device,
     App *a = data;
     a->dnd_drop_x = wl_fixed_to_double(x);
     a->dnd_drop_y = wl_fixed_to_double(y);
+    dnd_target_refresh(a);
 }
 
 /* v3 offers must be finished, otherwise wlroots turns a successful drop into
@@ -5306,6 +5500,8 @@ static void dnd_offer_release(App *a, int success)
     a->dnd_accept = a->dnd_accepted = 0;
     a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
     a->dnd_drop_out = NULL;
+    a->dnd_drop_kind = DND_DROP_NONE;
+    a->dnd_drop_dir[0] = 0;
     data_offer_prune(a, NULL);
 }
 
@@ -5317,6 +5513,8 @@ static void dnd_data_device_leave(void *data, struct wl_data_device *device)
     a->dnd_accept = a->dnd_accepted = 0;
     a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
     a->dnd_drop_out = NULL;
+    a->dnd_drop_kind = DND_DROP_NONE;
+    a->dnd_drop_dir[0] = 0;
     data_offer_prune(a, NULL);
 }
 
@@ -5324,16 +5522,40 @@ static void dnd_data_device_drop(void *data, struct wl_data_device *device)
 {
     (void)device;
     App *a = data;
-    /* If this is our own drag coming back to the desktop, reposition icons.
-     * An incoming drag from another app must copy files even though it
-     * entered our surface (dnd_drop_out is set for any drag on our surface). */
-    int ok = 0;
+    Out *src = a->dnd_source ? a->dnd_src_out : NULL;
+    Out *dst = a->dnd_drop_out ? a->dnd_drop_out : src;
+    DIcon *target = dnd_drop_target(a, src, dst);
+    int kind = target ? (target->is_dir ? DND_DROP_DIR : DND_DROP_FILE)
+                      : DND_DROP_NONE;
+    if (kind == DND_DROP_NONE && a->dnd_source && dst &&
+        dnd_icon_at(dst, a->dnd_drop_x, a->dnd_drop_y))
+        kind = DND_DROP_NOOP;
+
+    /* Dropping on a file, or on one of the dragged icons, is inert.  Do not
+     * finish the offer: a source offering MOVE would delete its originals. */
+    if (kind == DND_DROP_FILE || kind == DND_DROP_NOOP) {
+        a->dnd_drop_out = NULL;
+        dnd_offer_release(a, 0);
+        return;
+    }
+
+    char folder[PATH_MAX] = { 0 };
+    if (kind == DND_DROP_DIR && target)
+        snprintf(folder, sizeof folder, "%s", target->path);
+    const char *dir = kind == DND_DROP_DIR ? folder : a->desktop_dir;
+
+    int ok = 0, did_move = 0;
     if (a->dnd_source) {
-        dnd_internal_drop(a);
+        dnd_internal_drop(a, kind, dir);
         ok = 1;
     } else if (a->dnd_offer && a->dnd_accept) {
-        ok = dnd_receive_uris(a, a->dnd_offer);
+        ok = dnd_receive_uris(a, a->dnd_offer, dir, &did_move);
     }
+    /* We may have copied while the compositor negotiated MOVE.  Finishing
+     * then would make the source delete its originals too. */
+    if (ok && !did_move &&
+        a->dnd_offer_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE)
+        ok = 0;
     dnd_offer_release(a, ok);
 }
 
@@ -5924,6 +6146,7 @@ int main(int argc, char **argv)
     if (a->xkb_ctx) xkb_context_unref(a->xkb_ctx);
     clip_write_cancel_all(a);
     if (a->dnd_source) wl_data_source_destroy(a->dnd_source);
+    a->dnd_actions_set = 0;
     if (a->clip_source) wl_data_source_destroy(a->clip_source);
     data_offer_destroy_all(a);
     dnd_icon_destroy(a);

@@ -99,6 +99,9 @@
 #define BTN_LEFT  0x110
 #define BTN_RIGHT 0x111
 
+#define DND_FOLDER_OPEN_MS  190
+#define DND_FOLDER_CLOSE_MS 130
+
 /* Same destructive-action colour as jtfiles' confirmation dialog. */
 #define C_DANGER  0xE0685E
 
@@ -347,6 +350,10 @@ struct App {
     double dnd_drop_x, dnd_drop_y;          /* internal drop position */
     int dnd_drop_kind;                      /* current drop target, see DND_DROP_* */
     char dnd_drop_dir[PATH_MAX];            /* directory the drop would land in */
+    /* Folder whose desktop icon is opening/closing under the drag pointer. */
+    char dnd_folder_path[PATH_MAX];
+    double dnd_folder_t0;
+    int dnd_folder_open;                    /* 1 opening/open, 0 closing */
 
     /* Wayland clipboard (wl_data_device selection) */
     struct wl_data_source *clip_source;     /* we own the selection */
@@ -451,6 +458,11 @@ static void dnd_offer_update_actions(App *a);
 static DIcon *dnd_drop_target(App *a, Out *src, Out *dst);
 static DIcon *dnd_icon_at(Out *o, double x, double y);
 static void dnd_target_refresh(App *a);
+static int  dnd_folder_anim_active(App *a);
+static void dnd_folder_anim_tick(App *a);
+static void dnd_folder_anim_stop(App *a);
+static void dnd_folder_anim_clear(App *a);
+static double dnd_folder_open_amount(App *a, const char *path);
 static int dnd_path_within(const char *path, const char *dir);
 static int  ctl_init(App *a);
 static void clipboard_publish(App *a);
@@ -762,6 +774,100 @@ static void dnd_offer_update_actions(App *a)
     wl_data_offer_set_actions(a->dnd_offer, supported, preferred);
 }
 
+static double dnd_folder_elapsed_ms(App *a)
+{
+    return (now_sec() - a->dnd_folder_t0) * 1000.0;
+}
+
+static double dnd_folder_ease_out(double p)
+{
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    p = 1.0 - p;
+    return 1.0 - p * p * p;
+}
+
+static double dnd_folder_ease_in(double p)
+{
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    return p * p;
+}
+
+static int dnd_folder_anim_active(App *a)
+{
+    if (!a->dnd_folder_path[0]) return 0;
+    double dur = a->dnd_folder_open ? DND_FOLDER_OPEN_MS
+                                    : DND_FOLDER_CLOSE_MS;
+    return dnd_folder_elapsed_ms(a) < dur;
+}
+
+static void dnd_folder_anim_tick(App *a)
+{
+    if (!a->dnd_folder_path[0]) return;
+    double dur = a->dnd_folder_open ? DND_FOLDER_OPEN_MS
+                                    : DND_FOLDER_CLOSE_MS;
+    if (dnd_folder_elapsed_ms(a) < dur) {
+        all_mark(a);
+        return;
+    }
+    if (!a->dnd_folder_open) {
+        a->dnd_folder_path[0] = 0;
+        a->dnd_folder_t0 = 0.0;
+        a->dnd_folder_open = 1;
+        all_mark(a);
+    }
+}
+
+/* Animate the desktop folder under the drag pointer.  Repeated motion events
+ * over the same icon must not restart the open transition on every frame. */
+static void dnd_folder_anim_set(App *a, const char *path, int open)
+{
+    if (!path || !*path) {
+        dnd_folder_anim_stop(a);
+        return;
+    }
+    if (a->dnd_folder_path[0] && !strcmp(a->dnd_folder_path, path) &&
+        a->dnd_folder_open == open)
+        return;
+    snprintf(a->dnd_folder_path, sizeof a->dnd_folder_path, "%s", path);
+    a->dnd_folder_open = open;
+    a->dnd_folder_t0 = now_sec();
+    all_mark(a);
+}
+
+static void dnd_folder_anim_stop(App *a)
+{
+    if (!a->dnd_folder_path[0] || !a->dnd_folder_open) return;
+    a->dnd_folder_open = 0;
+    a->dnd_folder_t0 = now_sec();
+    all_mark(a);
+}
+
+static void dnd_folder_anim_clear(App *a)
+{
+    if (!a->dnd_folder_path[0]) return;
+    a->dnd_folder_path[0] = 0;
+    a->dnd_folder_t0 = 0.0;
+    a->dnd_folder_open = 1;
+    all_mark(a);
+}
+
+static double dnd_folder_open_amount(App *a, const char *path)
+{
+    if (!a->dnd_folder_path[0] || !path || strcmp(a->dnd_folder_path, path))
+        return 0.0;
+    double ms = dnd_folder_elapsed_ms(a);
+    if (a->dnd_folder_open) {
+        if (ms <= 0.0) return 0.0;
+        if (ms >= DND_FOLDER_OPEN_MS) return 1.0;
+        return dnd_folder_ease_out(ms / DND_FOLDER_OPEN_MS);
+    }
+    if (ms <= 0.0) return 1.0;
+    if (ms >= DND_FOLDER_CLOSE_MS) return 0.0;
+    return 1.0 - dnd_folder_ease_in(ms / DND_FOLDER_CLOSE_MS);
+}
+
 static void dnd_target_refresh(App *a)
 {
     DIcon *ic = dnd_drop_target(a, a->dnd_source ? a->dnd_src_out : NULL,
@@ -775,6 +881,7 @@ static void dnd_target_refresh(App *a)
         snprintf(dir, sizeof dir, "%s", ic->path);
     else
         snprintf(dir, sizeof dir, "%s", a->desktop_dir ? a->desktop_dir : "");
+    dnd_folder_anim_set(a, kind == DND_DROP_DIR ? dir : NULL, 1);
     a->dnd_drop_kind = kind;
     snprintf(a->dnd_drop_dir, sizeof a->dnd_drop_dir, "%s", dir);
     dnd_offer_update_actions(a);
@@ -1855,6 +1962,7 @@ static void draw_icon(App *a, cairo_t *cr, Out *o, DIcon *ic,
 {
     int cw = cell_w(), ch = cell_h();
     double x = ic->x + dx, y = ic->y + dy;
+    double open = ic->is_dir ? dnd_folder_open_amount(a, ic->path) : 0.0;
 
     if (ic->selected) {
         cairo_set_source_rgba(cr, JTI_R(a->pal.accent), JTI_G(a->pal.accent),
@@ -1875,11 +1983,34 @@ static void draw_icon(App *a, cairo_t *cr, Out *o, DIcon *ic,
         jti_rounded_rect(cr, x + 2, y + 2, cw - 4, ch - 4, 7);
         cairo_fill(cr);
     }
+    if (open > 0.0) {
+        cairo_set_source_rgba(cr, JTI_R(a->pal.accent), JTI_G(a->pal.accent),
+                              JTI_B(a->pal.accent), 0.18);
+        jti_rounded_rect(cr, x + 2, y + 2, cw - 4, ch - 4, 7);
+        cairo_fill(cr);
+        cairo_set_source_rgba(cr, JTI_R(a->pal.accent_hi),
+                              JTI_G(a->pal.accent_hi),
+                              JTI_B(a->pal.accent_hi), 0.85);
+        cairo_set_line_width(cr, 1.2);
+        jti_rounded_rect(cr, x + 2, y + 2, cw - 4, ch - 4, 7);
+        cairo_stroke(cr);
+    }
 
     icon_surface_for(a, ic);
     double ix = x + (cw - a->icon_size) / 2.0;  /* center icon in the cell */
     double iy = y + CELL_PAD_TOP;               /* same top as the old GTK version */
-    if (ic->sf) {
+    if (open > 0.0) {
+        cairo_surface_t *sf = jti_icon_surface_open(ic->icon, a->icon_size,
+                                                   &a->pal, 1, ic->name, open);
+        if (sf) {
+            cairo_save(cr);
+            cairo_set_source_surface(cr, sf, ix, iy);
+            cairo_rectangle(cr, ix, iy, a->icon_size, a->icon_size);
+            cairo_fill(cr);
+            cairo_restore(cr);
+            cairo_surface_destroy(sf);
+        }
+    } else if (ic->sf) {
         cairo_save(cr);
         cairo_pattern_t *pat = cairo_pattern_create_for_surface(ic->sf);
         cairo_matrix_t m;
@@ -5502,6 +5633,7 @@ static void dnd_offer_release(App *a, int success)
     a->dnd_drop_out = NULL;
     a->dnd_drop_kind = DND_DROP_NONE;
     a->dnd_drop_dir[0] = 0;
+    dnd_folder_anim_stop(a);
     data_offer_prune(a, NULL);
 }
 
@@ -5515,6 +5647,7 @@ static void dnd_data_device_leave(void *data, struct wl_data_device *device)
     a->dnd_drop_out = NULL;
     a->dnd_drop_kind = DND_DROP_NONE;
     a->dnd_drop_dir[0] = 0;
+    dnd_folder_anim_stop(a);
     data_offer_prune(a, NULL);
 }
 
@@ -6041,6 +6174,8 @@ int main(int argc, char **argv)
             if (menu_tree_anim_active(a->outs[i].menu) &&
                 SEL_LAP_TICK_MS < timeout_ms)
                 timeout_ms = SEL_LAP_TICK_MS;
+        if (dnd_folder_anim_active(a) && SEL_LAP_TICK_MS < timeout_ms)
+            timeout_ms = SEL_LAP_TICK_MS;
         int r = poll(fds, (nfds_t)nfds, timeout_ms);
         if (r < 0) {
             if (errno == EINTR) continue;
@@ -6090,6 +6225,10 @@ int main(int argc, char **argv)
                 a->post_sel_anim_start = -1; /* lap played for this batch */
             all_mark(a);
         }
+
+        /* Keep the folder-lid animation advancing on the frame clock while a
+         * drag is over a folder or while it closes after leave/drop. */
+        dnd_folder_anim_tick(a);
 
         for (int i = 0; i < a->n_outs; i++) menu_tree_tick(a->outs[i].menu, now_sec());
 
@@ -6147,6 +6286,7 @@ int main(int argc, char **argv)
     clip_write_cancel_all(a);
     if (a->dnd_source) wl_data_source_destroy(a->dnd_source);
     a->dnd_actions_set = 0;
+    dnd_folder_anim_clear(a);
     if (a->clip_source) wl_data_source_destroy(a->clip_source);
     data_offer_destroy_all(a);
     dnd_icon_destroy(a);

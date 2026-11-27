@@ -355,6 +355,40 @@ static void jti_folder_body(cairo_t *cr, const JtiPalette *p)
     cairo_stroke(cr);
 }
 
+/* Same folder with its tab lifted into an open lid.  open=0 matches
+ * jti_folder_body() exactly, so the transition starts from the normal icon. */
+static void jti_folder_body_open(cairo_t *cr, const JtiPalette *p, double open)
+{
+    if (open <= 0.0) {
+        jti_folder_body(cr, p);
+        return;
+    }
+    if (open > 1.0) open = 1.0;
+
+    jti_rounded_rect(cr, 5.0, 17.0, 38.0, 25.0, 4.0);
+    jti_accent_fill(cr, 5.0, 17.0, 38.0, 25.0, p);
+    jti_rounded_rect(cr, 5.6, 17.6, 36.8, 23.8, 3.6);
+    jti_rgba(cr, p->accent_lo, 0.9);
+    cairo_set_line_width(cr, 1.1);
+    cairo_stroke(cr);
+
+    jti_rounded_rect(cr, 7.0, 18.4, 34.0, 4.4, 2.2);
+    jti_rgba(cr, p->accent_lo, 0.78);
+    cairo_fill(cr);
+
+    cairo_save(cr);
+    cairo_translate(cr, 5.0, 17.0);
+    cairo_rotate(cr, -0.62 * open);
+    jti_rounded_rect(cr, 0.0, -5.0, 18.0, 8.0, 2.5);
+    jti_rgba(cr, p->accent_hi, 0.98);
+    cairo_fill(cr);
+    jti_rounded_rect(cr, 0.4, -4.6, 17.2, 7.2, 2.2);
+    jti_rgba(cr, p->accent_lo, 0.80);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+}
+
 static void jti_home_glyph(cairo_t *cr, const JtiPalette *p)
 {
     jti_rgba(cr, p->on_accent, 0.88);
@@ -601,6 +635,38 @@ static void jti_big_folder(cairo_t *cr, const JtiPalette *p)
     cairo_stroke(cr);
 }
 
+static void jti_big_folder_open(cairo_t *cr, const JtiPalette *p, double open)
+{
+    if (open <= 0.0) {
+        jti_big_folder(cr, p);
+        return;
+    }
+    if (open > 1.0) open = 1.0;
+
+    jti_big_plate(cr, 5.0, 16.0, 38.0, 26.0, p);
+    jti_rounded_rect(cr, 7.0, 18.2, 34.0, 4.8, 2.4);
+    jti_rgba(cr, p->accent_lo, 0.70);
+    cairo_fill(cr);
+
+    cairo_save(cr);
+    cairo_translate(cr, 5.0, 16.0);
+    cairo_rotate(cr, -0.62 * open);
+    jti_rounded_rect(cr, 0.0, -5.0, 19.0, 8.5, 2.5);
+    jti_rgba(cr, p->accent, 0.95);
+    cairo_fill(cr);
+    jti_rounded_rect(cr, 0.4, -4.6, 18.2, 7.7, 2.2);
+    jti_rgba(cr, p->accent_hi, 0.70);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+
+    cairo_move_to(cr, 9.0, 21.5);
+    cairo_line_to(cr, 39.0, 21.5);
+    jti_rgba(cr, p->accent_hi, 0.40);
+    cairo_set_line_width(cr, 1.2);
+    cairo_stroke(cr);
+}
+
 static void jti_big_glyph(cairo_t *cr, int kind, const JtiPalette *p)
 {
     jti_rgba(cr, p->accent_hi, 0.96);
@@ -794,6 +860,57 @@ static void jti_icon_render(cairo_t *cr, const char *name, int px,
             break;
         }
     }
+}
+
+/* Folder variant used while a drag hovers over it.  Non-folder icons are
+ * rendered normally; this only changes the folder body/lid geometry. */
+static void jti_icon_render_open(cairo_t *cr, const char *name, int px,
+                                 const JtiPalette *p, int big,
+                                 const char *display, double open)
+{
+    int kind = jti_icon_kind(name);
+    int folder = kind == JTI_FOLDER || kind == JTI_FOLDER_LINK ||
+                 kind == JTI_HOME || kind == JTI_DESKTOP ||
+                 kind == JTI_DOWNLOADS;
+    if (!folder || open <= 0.0) {
+        jti_icon_render(cr, name, px, p, big, display);
+        return;
+    }
+
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    cairo_scale(cr, (double)px / 48.0, (double)px / 48.0);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    jti_set_crisp(cr, px);
+
+    if (big) {
+        jti_big_folder_open(cr, p, open);
+        jti_big_glyph(cr, kind, p);
+    } else {
+        jti_folder_body_open(cr, p, open);
+        if (kind == JTI_HOME) jti_home_glyph(cr, p);
+        else if (kind == JTI_DESKTOP) jti_desktop_glyph(cr, p);
+        else if (kind == JTI_DOWNLOADS) jti_downloads_glyph(cr, p);
+        else if (kind == JTI_FOLDER_LINK) jti_link_badge(cr, p);
+    }
+}
+
+static cairo_surface_t *jti_icon_surface_open(const char *name, int px,
+                                              const JtiPalette *p, int big,
+                                              const char *display, double open)
+{
+    if (!name || !*name || px < 1) return NULL;
+    cairo_surface_t *sf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, px, px);
+    if (cairo_surface_status(sf) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(sf);
+        return NULL;
+    }
+    cairo_t *cr = cairo_create(sf);
+    jti_icon_render_open(cr, name, px, p, big, display, open);
+    cairo_destroy(cr);
+    cairo_surface_flush(sf);
+    return sf;
 }
 
 static cairo_surface_t *jti_icon_surface(const char *name, int px,
